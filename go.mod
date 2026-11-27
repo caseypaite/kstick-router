@@ -1,4 +1,4 @@
-module kstick-router
+module github.com/caseypaite/kstick-router
 
 go 1.26.0
 

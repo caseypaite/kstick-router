@@ -13,7 +13,7 @@ Router firmware add-on for cheap Qualcomm **MSM8916 4G LTE dongles and pocket ro
 - **Data usage:** per-day accounting with daily/monthly caps, schedules, per-device internet times, OS update blocking.
 - **MF800 status screen:** dashboards on the 1.44" LCD of the MF800 pocket router.
 
-The backend is Go (standard library only, plus `rsc.io/qr`). The front ends are plain JavaScript with no build step
+**Status:** in daily use on the two boards below; a hobby project, provided as is. The backend is Go (standard library only, plus `rsc.io/qr`). The front ends are plain JavaScript with no build step
 and no dependencies.
 
 ## Supported hardware
@@ -33,7 +33,7 @@ satellites, so there is no GPS feature.
 
 ## Install
 
-Requirements on the PC: Go (1.24+), `ssh`/`scp`, and optionally Node.js (syntax check of the XP UI).
+Requirements on the PC: Go (1.26+), `ssh`/`scp`, and optionally Node.js (syntax check of the XP UI).
 Flash the device with OpenStick Debian first, and connect it by USB.
 
 ```sh

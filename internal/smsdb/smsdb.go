@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"kstick-router/internal/smssend"
+	"github.com/caseypaite/kstick-router/internal/smssend"
 
 	_ "modernc.org/sqlite"
 )

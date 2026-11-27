@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"kstick-router/internal/smsdb"
+	"github.com/caseypaite/kstick-router/internal/smsdb"
 )
 
 func TestCheckSecretURL(t *testing.T) {

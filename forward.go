@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"kstick-router/internal/smsdb"
+	"github.com/caseypaite/kstick-router/internal/smsdb"
 )
 
 var forwardPath = "/etc/router/forward.json" // a var for tests

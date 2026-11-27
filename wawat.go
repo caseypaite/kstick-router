@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"kstick-router/internal/smsdb"
+	"github.com/caseypaite/kstick-router/internal/smsdb"
 )
 
 const (

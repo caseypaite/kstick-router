@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"kstick-router/internal/smscfg"
-	"kstick-router/internal/smsdb"
+	"github.com/caseypaite/kstick-router/internal/smscfg"
+	"github.com/caseypaite/kstick-router/internal/smsdb"
 )
 
 type SMSCtlCfg struct {

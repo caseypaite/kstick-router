@@ -22,9 +22,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"kstick-router/internal/smscfg"
-	"kstick-router/internal/smsdb"
-	"kstick-router/internal/smssend"
+	"github.com/caseypaite/kstick-router/internal/smscfg"
+	"github.com/caseypaite/kstick-router/internal/smsdb"
+	"github.com/caseypaite/kstick-router/internal/smssend"
 )
 
 const simImportMarker = "/var/lib/router/sms-sim-imported"

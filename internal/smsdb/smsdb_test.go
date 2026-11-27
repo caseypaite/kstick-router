@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"kstick-router/internal/smssend"
+	"github.com/caseypaite/kstick-router/internal/smssend"
 )
 
 func TestDB(t *testing.T) {
