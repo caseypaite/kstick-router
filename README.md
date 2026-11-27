@@ -365,3 +365,14 @@ On the device: settings in `/etc/router/router.json` (owned by the web UI), gene
 `/etc/router/{firewall.nft,dnsmasq.conf,wan.conf}`, the TLS certificate in `/etc/router/tls/`, UI files in
 `/usr/local/share/router-webui/{web,web-xp}`. Wi-Fi and LTE settings live in the NetworkManager profiles `hotspot` and
 `lte`. Logs: `journalctl -u router-webui` (for example `grep confirm:`, `grep "thermal guard"`, `grep lcd:`).
+
+## License
+
+MIT, see [LICENSE](LICENSE). These bundled third-party parts keep their own licenses:
+- `deploy/regdb/`: the wireless regulatory database (wireless-regdb, ISC).
+- `kernel/wcn36xx/`: a patch to the Linux wcn36xx driver and the module built from it (GPL-2.0, like the kernel), and
+  the Debian `iw` package (ISC).
+- `lcdassets.go`: glyphs pre-rendered from Noto Sans (SIL Open Font License 1.1) and icons from Font Awesome Free 7
+  (CC BY 4.0).
+- `docs/devices/`: product photos from retail listings, included only to identify the hardware; not covered by the
+  MIT license.
