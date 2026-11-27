@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KStick SMS Gateway</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header><h1>KStick SMS Gateway</h1><p>Send SMS to Indian mobile numbers through an API.</p></header>
+<main>
+<section>
+  <h2>Send a test message</h2>
+  <form id="send">
+    <label>API key<input name="key" type="password" autocomplete="off" required placeholder="ksms_…"></label>
+    <label>Mobile number<input name="to" inputmode="numeric" pattern="[6-9][0-9]{9}" maxlength="10" required placeholder="9876543210"></label>
+    <label>Message <span class="muted">(optional; leave empty to send the configured default message)</span><textarea name="message" rows="4" maxlength="1000"></textarea></label>
+    <button>Send SMS</button>
+  </form>
+  <pre id="out" hidden></pre>
+  <p class="muted">The API key is only sent with this request; it is not stored by this page.</p>
+</section>
+
+<section>
+  <h2>API</h2>
+  <h3><code>POST /api/v1/sms</code></h3>
+  <p>Authenticate with <code>Authorization: Bearer &lt;API key&gt;</code> (or <code>X-API-Key</code>). Send JSON or a form body:</p>
+  <table>
+    <tr><th>Field</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>to</code></td><td>yes</td><td>10-digit Indian mobile number, digits only, starting with 6–9 (no <code>+91</code> or <code>0</code>). Sent as <code>+91XXXXXXXXXX</code>.</td></tr>
+    <tr><td><code>message</code></td><td>no</td><td>Text to send. If omitted or empty, the gateway's configured default message is sent.</td></tr>
+  </table>
+  <pre>curl -X POST https://<span class="host">sms.example.com</span>/api/v1/sms \
+  -H "Authorization: Bearer $SMSGW_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"9876543210","message":"Your code is 123456"}'</pre>
+  <h4>Never send twice: <code>Idempotency-Key</code></h4>
+  <p>Add a header <code>Idempotency-Key: &lt;unique id&gt;</code> (1–100 letters, digits, <code>. _ : -</code>; a UUID or your
+    order id works). If the request is repeated with the same key (a network timeout, a retry by your HTTP client), the gateway
+    returns the first message's result instead of sending again (<code>Idempotent-Replayed: true</code>). Only a message that
+    definitely was not sent (<code>"status":"failed"</code>) is tried again. Reusing a key for a different number or text gives
+    <code>422</code>. Keys are remembered per API key, permanently.</p>
+  <pre>curl -X POST https://<span class="host">sms.example.com</span>/api/v1/sms \
+  -H "Authorization: Bearer $SMSGW_KEY" -H "Idempotency-Key: order-58213-otp" \
+  -H "Content-Type: application/json" -d '{"to":"9876543210","message":"Your code is 123456"}'</pre>
+  <h4>Waiting</h4>
+  <p>The request waits for the modem up to <code>?wait=</code> seconds (0–90, default 60). If the SMS has not gone out by then
+    (the modem is busy or slow) the answer is <code>202</code> with <code>"status":"queued"</code> or <code>"sending"</code>:
+    it is still sent, and <code>status_url</code> tells you where to check.</p>
+  <p>Answers (all include <code>id</code>, <code>status</code> and <code>status_url</code>):</p>
+  <table>
+    <tr><th>Status</th><th>Body</th><th>Meaning</th></tr>
+    <tr><td>200</td><td><code>"ok":true,"status":"sent"</code></td><td>The network accepted the SMS</td></tr>
+    <tr><td>202</td><td><code>"ok":true,"status":"queued"</code> / <code>"sending"</code></td><td>Still going; poll <code>GET /api/v1/sms/{id}</code></td></tr>
+    <tr><td>503</td><td><code>"ok":false,"status":"failed"</code></td><td>Not sent (modem not registered, network refused): safe to retry</td></tr>
+    <tr><td>503</td><td><code>"ok":false,"status":"unknown"</code></td><td>The modem did not answer in time: it may have been sent. A retry with the same <code>Idempotency-Key</code> will not send it again</td></tr>
+  </table>
+  <pre>{"ok":true,"id":"3f1c…","status":"sent","to":"+919876543210","message_source":"request","chars":19,
+ "created_at":"…","sent_at":"…","status_url":"/api/v1/sms/3f1c…","delivery_report":{"status":"requested"}}</pre>
+  <p>Other errors return <code>{"ok":false,"error":"…"}</code>:</p>
+  <table>
+    <tr><th>Status</th><th>Meaning</th></tr>
+    <tr><td>400</td><td>Invalid number, message too long, bad body or <code>Idempotency-Key</code>, or no message and no default</td></tr>
+    <tr><td>401</td><td>Missing or invalid API key</td></tr>
+    <tr><td>403</td><td>The API key does not have the permission this endpoint needs</td></tr>
+    <tr><td>422</td><td><code>Idempotency-Key</code> already used for a different message</td></tr>
+    <tr><td>429</td><td>Rate limit reached (see <code>Retry-After</code>), or too many invalid keys</td></tr>
+    <tr><td>503</td><td>Gateway disabled</td></tr>
+  </table>
+
+  <h3><code>GET /api/v1/sms/{id}</code></h3>
+  <p>The current status of a message your key sent, with its delivery report when the gateway requests them:
+    <code>"delivery_report":{"status":"requested"}</code> until the network reports, then <code>"delivered"</code> (with
+    <code>at</code>) or <code>"failed"</code>. Not every network sends reports.</p>
+
+  <h3><code>GET /api/v1/inbox</code></h3>
+  <p>Received SMS, oldest first, for keys given the <b>read inbox</b> permission in the router (it is off for new keys:
+    the inbox holds one-time codes). Parameters: <code>after_id</code> (return messages newer than this id),
+    <code>since</code> (RFC 3339 time), <code>limit</code> (1–100, default 50). Poll with the last <code>next_after_id</code>:</p>
+  <pre>curl "https://<span class="host">sms.example.com</span>/api/v1/inbox?after_id=0" -H "Authorization: Bearer $SMSGW_KEY"
+
+{"ok":true,"messages":[{"id":41,"from":"VM-BANK","text":"Your OTP is 123456","sms_time":"2026-11-26T10:00:00+05:30",
+ "received_at":"2026-11-26T10:00:04+05:30"}],"next_after_id":41,"more":false}</pre>
+  <p>For push delivery instead of polling, the router can POST each received SMS to a webhook (router web UI, SMS forwarding).</p>
+
+  <h3><code>GET /api/v1/status</code></h3>
+  <p>Returns modem state, limits, your key's permissions and today's usage for your key.</p>
+</section>
+</main>
+</body>
+</html>

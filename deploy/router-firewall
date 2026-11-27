@@ -1,0 +1,19 @@
+#!/bin/sh
+# Apply / remove the router firewall. Used by router-firewall.service.
+set -e
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+MSS="-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+case "$1" in
+  start|reload)
+    nft -f /etc/router/firewall.nft
+    # TCP MSS clamping (kernel lacks nft exthdr; use xt TCPMSS via iptables-nft)
+    iptables -t mangle -C FORWARD $MSS 2>/dev/null || iptables -t mangle -A FORWARD $MSS
+    ip6tables -t mangle -C FORWARD $MSS 2>/dev/null || ip6tables -t mangle -A FORWARD $MSS
+    ;;
+  stop)
+    nft delete table inet router 2>/dev/null || true
+    iptables -t mangle -D FORWARD $MSS 2>/dev/null || true
+    ip6tables -t mangle -D FORWARD $MSS 2>/dev/null || true
+    ;;
+  *) echo "usage: $0 start|stop|reload" >&2; exit 2 ;;
+esac

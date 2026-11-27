@@ -1,0 +1,13 @@
+[Unit]
+Description=Detach the text console from the SPI LCD (router-webui draws the status screen)
+DefaultDependencies=no
+After=systemd-udevd.service systemd-modules-load.service
+Before=sysinit.target router-webui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lcd-fbcon-detach
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

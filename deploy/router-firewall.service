@@ -1,0 +1,16 @@
+[Unit]
+Description=KStick router firewall (nftables)
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+After=systemd-modules-load.service local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/router-firewall start
+ExecReload=/usr/local/sbin/router-firewall reload
+ExecStop=/usr/local/sbin/router-firewall stop
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=KStick CPU frequency policy (schedutil, max 400 MHz to run cooler)
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Available on this MSM8916: 200, 400, 800, 998.4 MHz (one policy for all 4 cores).
+# 400 MHz: benchmarked 2026-11-22. Even at the 200 MHz thermal floor the stick moved ~75 Mbit/s over USB,
+# above what Cat-4 LTE delivers, so higher clocks only add heat. Raise MAX to 800000 for more headroom.
+Environment=GOV=schedutil MAX=400000
+ExecStart=/bin/sh -c 'for p in /sys/devices/system/cpu/cpufreq/policy*; do echo $GOV > $p/scaling_governor; echo $MAX > $p/scaling_max_freq; done'
+# Stopping restores the hardware maximum.
+ExecStop=/bin/sh -c 'for p in /sys/devices/system/cpu/cpufreq/policy*; do cat $p/cpuinfo_max_freq > $p/scaling_max_freq; done'
+
+[Install]
+WantedBy=multi-user.target

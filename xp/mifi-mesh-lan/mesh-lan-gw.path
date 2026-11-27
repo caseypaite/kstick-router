@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-apply mesh-lan-gw when router-webui rewrites the firewall
+
+[Path]
+PathChanged=/etc/router/firewall.nft
+Unit=mesh-lan-gw.service
+
+[Install]
+WantedBy=multi-user.target

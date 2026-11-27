@@ -1,0 +1,107 @@
+#!/bin/bash
+# kstick-blackbox: diagnostic logger for unexplained resets (no netconsole/pstore/lockup detector
+# in this kernel). Every boot: the PM8916 power-on/off reason registers. Every 5 s: temperatures,
+# supply voltages, LTE/uplink state, bam-dmux PM state, load and memory, each line fsync'd so the
+# last state before a sudden reset survives. Log: /var/log/kstick-blackbox.log (rotates at 2 MB).
+# Cheap on purpose: values are read with bash builtins (read, printf %(...)T, a read -t timeout instead of
+# sleep), so a 5 s line costs one process (the fsync), and the 30 s checks run each tool once.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LOG=${LOG:-/var/log/kstick-blackbox.log}; MAX=2097152; INTERVAL=${INTERVAL:-5}
+ADC=$(ls -d /sys/bus/iio/devices/iio:device* 2>/dev/null | head -1)
+for f in "$ADC"/in_voltage*_label; do
+	case $(cat "$f" 2>/dev/null) in VSYS) VS=${f%_label}_input ;; USBIN) UB=${f%_label}_input ;; esac
+done
+REGS=/sys/kernel/debug/regmap/0-00/registers
+
+LOGSIZE=$(stat -c %s $LOG 2>/dev/null || echo 0) # kept up to date by out(), so rotation needs no stat per line
+out() {
+	printf '%s\n' "$*" >> $LOG
+	sync -d $LOG 2>/dev/null || sync
+	LOGSIZE=$((LOGSIZE + ${#1} + 1)) # the log is ASCII: characters = bytes
+}
+# rd VAR FILE [DEFAULT]: first line of FILE into VAR without starting a process
+rd() { IFS= read -r "$1" 2>/dev/null < "$2" || printf -v "$1" '%s' "${3:-}"; }
+bits() { # $1 value (hex) $2.. names for bit0..bit7
+	local v=$((16#$1)) i=0 n s=""; shift
+	for n in "$@"; do [ $(( (v >> i) & 1 )) = 1 ] && s="$s$n,"; i=$((i+1)); done
+	echo "${s%,}"
+}
+reg() { grep -m1 "^0*$1:" $REGS 2>/dev/null | awk '{print $2}'; }
+
+# PM8916 (PON gen1): 0x808 PON_REASON1, 0x80a WARM_RESET_REASON1, 0x80c POFF_REASON1, 0x80d POFF_REASON2
+pon=$(reg 808); warm=$(reg 80a); poff1=$(reg 80c); poff2=$(reg 80d)
+out "=== BOOT $(date -Is) boot_id=$(cat /proc/sys/kernel/random/boot_id) kernel=$(uname -r)"
+out "    PON=0x${pon:-??}($(bits ${pon:-0} HARD_RESET SMPL RTC DC_CHG USB_CHG PON1 CBLPWR KPDPWR)) WARM=0x${warm:-??}($(bits ${warm:-0} SOFT PS_HOLD PMIC_WD GP1 GP2 KPDPWR_RESIN RESIN KPDPWR)) POFF=0x${poff1:-??}($(bits ${poff1:-0} SOFT PS_HOLD PMIC_WD GP1 GP2 KPDPWR_RESIN RESIN KPDPWR)) POFF2=0x${poff2:-??}($(bits ${poff2:-0} - CHARGER TFT UVLO OTST3 STAGE3 - -))"
+out "    previous boot ended: $(journalctl -b -1 -n 1 -o short-iso --no-pager 2>/dev/null | tail -1 | cut -c1-25)"
+
+# Where do Wi-Fi clients' web UI requests get lost? Count them before every input firewall (prio -300),
+# after all of them (prio 300, so WARP's and the router's drops already happened) and the replies going out.
+probe_table() {
+	nft -f - <<'NFT' 2>/dev/null
+table inet kstick-probe {
+	counter ui_in_before {}
+	counter ui_in_after {}
+	counter ui_out_reply {}
+	chain pre { type filter hook input priority -300; policy accept; iifname "wlan0" tcp dport { 80, 443 } counter name ui_in_before; }
+	chain post { type filter hook input priority 300; policy accept; iifname "wlan0" tcp dport { 80, 443 } counter name ui_in_after; }
+	chain out { type filter hook output priority 300; policy accept; oifname "wlan0" tcp sport { 80, 443 } counter name ui_out_reply; }
+}
+NFT
+}
+# probe_counts: the three counters from one listing (creates the table the first time)
+probe_counts() {
+	local l name="" found=0
+	pin="" pafter="" pout=""
+	while read -r l; do
+		case $l in
+			"counter "*) name=${l#counter }; name=${name%% *}; found=1 ;;
+			"packets "*) set -- $l
+				case $name in ui_in_before) pin=$2 ;; ui_in_after) pafter=$2 ;; ui_out_reply) pout=$2 ;; esac ;;
+		esac
+	done < <(nft list table inet kstick-probe 2>/dev/null)
+	[ $found = 1 ] || probe_table
+}
+lanip() { local _ _s a; read -r _ _s a _ < <(ip -4 -br addr show wlan0 2>/dev/null); LANIP=${a%%/*}; }
+LANIP=""; lanip
+exec {SLEEP}<> <(:) # an fd nobody writes to: "read -t" on it is a sleep without a process
+n=0; extra=""
+while :; do
+	# every 30 s: is the web UI answering on the Wi-Fi address, is WARP's firewall dropping, how many Wi-Fi clients
+	if [ $((n % 6)) = 0 ]; then
+		[ -n "$LANIP" ] || lanip
+		ui=$(curl -sk -o /dev/null -m 4 -w '%{http_code}' "https://${LANIP:-192.168.4.1}/" 2>/dev/null); ui=${ui:-000}
+		# WARP: its status, and the last rule of its input chain ("drop" = catch-all deny)
+		ws=""
+		while IFS= read -r l; do case $l in "Status update:"*) ws=${l#Status update:}; ws=${ws// /} ;; esac; done \
+			< <(timeout 3 warp-cli --accept-tos status 2>/dev/null)
+		wl=""
+		while read -r -a w; do [ ${#w[@]} -gt 0 ] && [ "${w[0]}" != "}" ] && wl=${w[-1]}; done \
+			< <(nft list chain inet cloudflare-warp input 2>/dev/null)
+		sta=0
+		while read -r l; do case $l in Station*) sta=$((sta + 1)) ;; esac; done < <(iw dev wlan0 station dump 2>/dev/null)
+		probe_counts
+		rules=0
+		while read -r l; do rules=$((rules + 1)); done < <(ip rule 2>/dev/null)
+		extra=" ui=$ui warp=${ws:-?}/${wl:-none} wifi=$sta uipkts=$pin/$pafter/$pout rules=$rules"
+	fi
+	n=$((n+1))
+	t=""; m=0
+	for z in /sys/class/thermal/thermal_zone*/temp; do rd v "$z" 0; v=$((v/1000)); t="$t$v "; [ $v -gt $m ] && m=$v; done
+	read -r l1 _ < /proc/loadavg
+	ma=0 st=0 sf=0
+	while read -r k v _; do
+		case $k in MemAvailable:) ma=$((v/1024)) ;; SwapTotal:) st=$v ;; SwapFree:) sf=$v ;; esac
+	done < /proc/meminfo
+	act="" lte=""
+	if [ -r /run/router/wan.state ]; then
+		while IFS= read -r l; do
+			case $l in active=*) act=${l#active=} ;; wwan0=*) lte=${l#wwan0=}; lte=${lte%% *} ;; esac
+		done < /run/router/wan.state
+	fi
+	rd bam /sys/class/net/wwan0/device/power/runtime_status none
+	rd vs "$VS" 0; rd ub "$UB" 0; rd cpu /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 0
+	printf -v now '%(%T)T' -1
+	out "$now T=${t% } max=$m vsys=$((vs/1000)) usbin=$((ub/1000)) load=$l1 mem=${ma}M swap=$(((st-sf)/1024))M cpu=$((cpu/1000)) up=${act:-none} lte=${lte:-?} bam=$bam$extra"
+	if [ $LOGSIZE -gt $MAX ]; then mv -f $LOG $LOG.1; LOGSIZE=0; fi
+	read -r -t $INTERVAL -u $SLEEP _ || :
+done

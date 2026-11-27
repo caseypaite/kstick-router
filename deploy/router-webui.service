@@ -1,0 +1,19 @@
+[Unit]
+Description=KStick router web UI
+After=network.target NetworkManager.service ModemManager.service router-firewall.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/router-webui
+# remove the thermal guard's rate limits if they are in place (quietly: usually there is no such table)
+ExecStopPost=-/bin/sh -c 'nft list table inet thermalguard >/dev/null 2>&1 && exec nft delete table inet thermalguard; exit 0'
+Restart=always
+RestartSec=3
+# Needs root: drives nmcli/mmcli/nft, verifies the admin password via PAM, runs chpasswd.
+Environment=GOMEMLIMIT=40MiB
+MemoryMax=128M
+PrivateTmp=yes
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

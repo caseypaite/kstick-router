@@ -1,0 +1,10 @@
+# build output (deploy.sh stages and compiles here)
+/build/
+/router-webui
+/kstick-smsgw
+*.test
+# local Claude Code settings
+/.claude/settings.local.json
+xp/viewer/deploy/lofi-viewer
+xp/dev/node_modules/
+*.orig

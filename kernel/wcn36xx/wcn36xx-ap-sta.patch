@@ -1,0 +1,53 @@
+--- main.c.orig	2026-11-24 21:34:57.327902000 +0530
++++ main.c	2026-11-24 21:34:57.433063951 +0530
+@@ -1410,6 +1410,20 @@
+ 	vht_cap->vht_mcs.tx_mcs_map = vht_cap->vht_mcs.rx_mcs_map;
+ }
+ 
++/* kstick: allow one STA and one AP at the same time (repeater), same channel */
++static const struct ieee80211_iface_limit wcn36xx_if_limits[] = {
++	{ .max = 1, .types = BIT(NL80211_IFTYPE_STATION) },
++	{ .max = 1, .types = BIT(NL80211_IFTYPE_AP) },
++};
++
++static const struct ieee80211_iface_combination wcn36xx_if_comb = {
++	.limits = wcn36xx_if_limits,
++	.n_limits = ARRAY_SIZE(wcn36xx_if_limits),
++	.max_interfaces = 2,
++	.num_different_channels = 1,
++	.beacon_int_infra_match = true,
++};
++
+ static int wcn36xx_init_ieee80211(struct wcn36xx *wcn)
+ {
+ 	static const u32 cipher_suites[] = {
+@@ -1432,6 +1446,19 @@
+ 		BIT(NL80211_IFTYPE_ADHOC) |
+ 		BIT(NL80211_IFTYPE_MESH_POINT);
+ 
++	wcn->hw->wiphy->iface_combinations = &wcn36xx_if_comb;
++	wcn->hw->wiphy->n_iface_combinations = 1;
++
++	/* a second MAC address for the second interface (locally administered) */
++	if (!is_zero_ether_addr(wcn->hw->wiphy->perm_addr)) {
++		memcpy(wcn->addresses[0].addr, wcn->hw->wiphy->perm_addr, ETH_ALEN);
++		memcpy(wcn->addresses[1].addr, wcn->hw->wiphy->perm_addr, ETH_ALEN);
++		wcn->addresses[1].addr[0] |= 0x02;
++		wcn->addresses[1].addr[5] ^= 0x01;
++		wcn->hw->wiphy->addresses = wcn->addresses;
++		wcn->hw->wiphy->n_addresses = 2;
++	}
++
+ 	wcn->hw->wiphy->bands[NL80211_BAND_2GHZ] = &wcn_band_2ghz;
+ 	if (wcn->rf_id != RF_IRIS_WCN3620)
+ 		wcn->hw->wiphy->bands[NL80211_BAND_5GHZ] = &wcn_band_5ghz;
+--- wcn36xx.h.orig	2026-11-24 21:34:57.328887148 +0530
++++ wcn36xx.h	2026-11-24 21:34:57.432802354 +0530
+@@ -207,6 +207,7 @@
+ 	struct ieee80211_hw	*hw;
+ 	struct device		*dev;
+ 	struct list_head	vif_list;
++	struct mac_address	addresses[2];	/* kstick: AP + STA concurrency */
+ 
+ 	const char		*nv_file;
+ 	const struct firmware	*nv;

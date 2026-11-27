@@ -1,0 +1,6 @@
+// The public SMS gateway runs as "smsgw" and may only create/send/delete SMS.
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.ModemManager1.Messaging" && subject.user == "smsgw") {
+        return polkit.Result.YES;
+    }
+});

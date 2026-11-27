@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KStick Router</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login" class="login hidden">
+  <form id="login-form" class="login-box" autocomplete="on">
+    <div class="brand big"><span class="logo">◆</span> KStick Router</div>
+    <p class="muted">4G LTE gateway administration</p>
+    <label>Username<input name="username" autocomplete="username" required></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <div id="login-error" class="error"></div>
+    <button class="btn primary wide" type="submit">Sign in</button>
+    <p class="muted small">Use the device's system account and its password.</p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <aside class="side">
+    <div class="brand"><span class="logo">◆</span> KStick</div>
+    <nav id="nav"></nav>
+    <div class="side-foot muted small" id="side-foot"></div>
+  </aside>
+  <main>
+    <header class="top">
+      <button id="menu-btn" class="btn ghost menu-btn" type="button">☰</button>
+      <h1 id="title"></h1>
+      <div class="top-right">
+        <span id="pill-wan" class="pill">WAN …</span>
+        <span id="pill-clients" class="pill">…</span>
+        <span id="pill-batt" class="pill hidden" title="Battery"></span>
+        <button id="logout" class="btn ghost" type="button">Sign out</button>
+      </div>
+    </header>
+    <div id="pending" class="pending hidden"></div>
+    <div id="toasts"></div>
+    <section id="view"></section>
+  </main>
+</div>
+
+<dialog id="modal">
+  <form method="dialog" id="modal-form">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="actions">
+      <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
+      <button value="ok" id="modal-ok" class="btn primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

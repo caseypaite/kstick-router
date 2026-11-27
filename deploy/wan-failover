@@ -1,0 +1,210 @@
+#!/bin/bash
+# Health-checked WAN selection for the KStick router.
+# NetworkManager keeps owning its routes in the main table. We add:
+#   rule 1000: lookup main suppress_prefixlength 0   (all routes except defaults)
+#   rule 1001: lookup 100                            (the one default route we chose)
+# If no uplink is healthy, table 100 is emptied and NM's metric order applies.
+# Cheap on purpose (it runs every INTERVAL forever): the default routes are read once per round, and time,
+# counters and the wait use bash builtins, so a quiet round starts ~4 processes (ip, nft, mv) instead of ~28.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+. /etc/router/wan.conf
+TABLE=100; STATE=/run/router/wan.state
+mkdir -p /run/router
+declare -A fails up
+for w in $WANS; do fails[$w]=$FAIL_AFTER; up[$w]=0; done   # down until proven up
+
+ip rule show | grep -q "lookup main suppress_prefixlength 0" || ip rule add priority 1000 lookup main suppress_prefixlength 0
+ip rule show | grep -q "lookup $TABLE"                       || ip rule add priority 1001 lookup $TABLE
+
+gw_of() { ip -4 route show default dev "$1" 2>/dev/null | awk '/via/{print $3; exit}'; }   # for the recovery jobs
+# read_gws: GW[<dev>] = the IPv4 gateway of each interface's first "default via" route in the main table (one ip call)
+declare -A GW
+read_gws() {
+  local l f i dev via
+  GW=()
+  while read -r -a f; do
+    dev="" via=""
+    for ((i = 0; i < ${#f[@]} - 1; i++)); do
+      case ${f[i]} in via) via=${f[i+1]} ;; dev) dev=${f[i+1]} ;; esac
+    done
+    [ -n "$dev" ] && [ -n "$via" ] && [ -z "${GW[$dev]}" ] && GW[$dev]=$via
+  done < <(ip -4 route show default 2>/dev/null)
+}
+now_s() { printf -v NOW '%(%s)T' -1; }
+probe() { local t; for t in $TARGETS; do ping -4 -n -q -c1 -W2 -I "$1" "$t" >/dev/null 2>&1 && return 0; done; return 1; }
+
+# ---- Quiet health checks for the LTE radio (PASSIVE_WANS, default wwan0)
+# Every packet keeps the modem transmitting at full power for ~10 s, so a ping every INTERVAL (15 s)
+# kept the radio awake ~2/3 of the time and the idle stick hot (see README "Idle LTE heat").
+# A healthy uplink in PASSIVE_WANS is therefore not pinged while its counters show traffic in both
+# directions since the last check (real replies are arriving), nor while it is completely idle, except
+# every IDLE_PROBE seconds. Anything else (sending without receiving = a possible data stall, a recent
+# failure, or not yet up) is probed every INTERVAL as before. PASSIVE_WANS="" restores always-ping.
+PASSIVE_WANS=${PASSIVE_WANS-wwan0}; IDLE_PROBE=${IDLE_PROBE:-120}
+declare -A last_rx last_tx last_probe how
+# wwan0's driver (bam-dmux) keeps no byte counters, so LTE bytes come from the router firewall's nft
+# counters lte_rx/lte_tx (they restart at 0 when the firewall reloads; a drop just means "probe").
+# counters <wan>: sets C_RX and C_TX
+counters() {
+  C_RX=0 C_TX=0
+  if [ "$1" = wwan0 ]; then
+    local f i name=""
+    while read -r -a f; do
+      [ "${f[0]}" = counter ] && name=${f[1]}
+      for ((i = 0; i < ${#f[@]} - 1; i++)); do
+        [ "${f[i]}" = bytes ] || continue
+        case $name in lte_rx) C_RX=${f[i+1]} ;; lte_tx) C_TX=${f[i+1]} ;; esac
+      done
+    done < <(nft list counters table inet router 2>/dev/null)
+  else
+    read -r C_RX 2>/dev/null < /sys/class/net/$1/statistics/rx_bytes || C_RX=0
+    read -r C_TX 2>/dev/null < /sys/class/net/$1/statistics/tx_bytes || C_TX=0
+  fi
+}
+is_passive() { [[ " $PASSIVE_WANS " == *" $1 "* ]]; }
+# check <wan>: 0 = healthy. Sets how[<wan>] to traffic | idle | probe.
+check() {
+  local w=$1 rx tx now; counters $w; rx=$C_RX tx=$C_TX; now_s; now=$NOW
+  local prx=${last_rx[$w]:-0} ptx=${last_tx[$w]:-0}
+  last_rx[$w]=$rx; last_tx[$w]=$tx
+  if is_passive $w && [ "${up[$w]}" = 1 ] && [ "${fails[$w]}" = 0 ]; then
+    if [ "$rx" -gt "$prx" ] && [ "$tx" -gt "$ptx" ]; then how[$w]=traffic; return 0; fi
+    if [ "$rx" = "$prx" ] && [ "$tx" = "$ptx" ] && [ $((now - ${last_probe[$w]:-0})) -lt $IDLE_PROBE ]; then how[$w]=idle; return 0; fi
+  fi
+  how[$w]=probe; last_probe[$w]=$now
+  probe $w; local rc=$?
+  counters $w; last_rx[$w]=$C_RX last_tx[$w]=$C_TX   # the probe's own packets are not traffic
+  return $rc
+}
+
+# ---- LTE self-healing (LTE_RECOVERY=0 in wan.conf disables it)
+# 1. After a modem firmware crash the bam-dmux driver can stay in runtime-PM state "error":
+#    wwan0 can no longer be brought up (EINVAL) and NetworkManager fails every attempt with
+#    config-failed. Fix: rebind bam-dmux and restart the modem firmware (remoteproc).
+# 2. Data stall: LTE has an IPv4 gateway and the driver looks fine, but every probe fails for
+#    STALL_AFTER seconds (seen 2026-11-22: the modem accepted packets but neither sent them nor
+#    received any; a reconnect timed out with esm-proc-timeout). Same fix as 1.
+# 3. LTE "connected" but no IPv4 for a long time (e.g. an IPv6-only bearer): reconnect once.
+# 4. Never registers: radio on, but the modem keeps searching for NOREG_AFTER seconds (seen
+#    2026-11-22 after the thermal cooldown switched the radio off and on: 19 "registration in
+#    network failed: Network timeout" in 30 min; a fresh modem start registered within seconds).
+#    Same fix as 1.
+# Runs in the background with a cooldown that doubles after each attempt that doesn't help.
+LTE_RECOVERY=${LTE_RECOVERY:-1}
+REC_MIN=600; REC_MAX=3600; NOV4_AFTER=300; STALL_AFTER=${STALL_AFTER:-120}; NOREG_AFTER=${NOREG_AFTER:-240}
+rec_cooldown=$REC_MIN; rec_last=0; rec_pid=""; rec_note=""; err_seen=0; nov4_since=0; stall_since=0; noreg_since=0
+lte_dev=wwan0qmi0   # NetworkManager's device for the gsm profile
+
+bam_status() { local s; read -r s 2>/dev/null < /sys/class/net/wwan0/device/power/runtime_status && echo "$s"; }
+modem_state() { mmcli -m any -K 2>/dev/null | awk -F': ' '/^modem.generic.state /{print $2; exit}'; }
+radio_on() { [ "$(nmcli radio wwan 2>/dev/null)" = enabled ]; }
+
+recover_bam() {   # $1: why
+  local dev drv rp r
+  dev=$(basename "$(readlink -f /sys/class/net/wwan0/device)")          # 4080000.remoteproc:bam-dmux
+  drv=$(readlink -f /sys/class/net/wwan0/device/driver)                 # /sys/bus/platform/drivers/bam-dmux
+  for r in /sys/class/remoteproc/remoteproc*; do [ "$(cat $r/name)" = "${dev%%:*}" ] && rp=$r; done
+  [ -n "$dev" ] && [ -d "$drv" ] && [ -n "$rp" ] || { logger -t wan-failover "LTE recovery: cannot locate bam-dmux/remoteproc ($dev $drv $rp)"; return 1; }
+  logger -t wan-failover "LTE recovery: $1; rebinding $dev and restarting $(basename $rp)"
+  echo "$dev" > "$drv/unbind"; sleep 2
+  echo "$dev" > "$drv/bind"; sleep 2
+  echo stop > "$rp/state"; sleep 3
+  echo start > "$rp/state"
+  logger -t wan-failover "LTE recovery: modem firmware restarted (bam-dmux now $(bam_status || echo absent)); NetworkManager reconnects LTE"
+}
+
+recover_nov4() {
+  local con; con=$(nmcli -g GENERAL.CONNECTION device show $lte_dev 2>/dev/null)
+  [ -n "$con" ] || return 1
+  logger -t wan-failover "LTE recovery: '$con' connected without IPv4 for ${NOV4_AFTER}s+; reconnecting"
+  nmcli -w 90 connection up "$con" >/dev/null 2>&1
+  logger -t wan-failover "LTE recovery: reconnect finished (IPv4 gateway: $(gw_of wwan0 || true))"
+}
+
+lte_watch() {
+  [ "$LTE_RECOVERY" = 1 ] && [[ " $WANS " == *" wwan0 "* ]] || return 0
+  if [ -n "$rec_pid" ]; then kill -0 "$rec_pid" 2>/dev/null && return 0; rec_pid=""; fi
+  # the thermal guard switched the LTE radio off on purpose (emergency cooldown): not a fault
+  # (the same for the LTE off schedule)
+  if [ -e /var/lib/router/thermal-cooldown ] || [ -e /var/lib/router/lte-schedule-off ]; then err_seen=0; nov4_since=0; stall_since=0; noreg_since=0; return 0; fi
+  if [ "${up[wwan0]}" = 1 ]; then rec_cooldown=$REC_MIN; rec_last=0; err_seen=0; nov4_since=0; stall_since=0; noreg_since=0; return 0; fi
+  local now reason=""; now_s; now=$NOW
+  # stuck driver: seen on two consecutive checks
+  if [ "$(bam_status)" = error ]; then err_seen=$((err_seen+1)); else err_seen=0; fi
+  [ $err_seen -ge 2 ] && reason=bam
+  # data stall: IPv4 gateway present, driver not in error, but probes keep failing
+  if [ -z "$reason" ] && [ -n "${GW[wwan0]}" ]; then
+    [ $stall_since = 0 ] && stall_since=$now
+    [ $((now - stall_since)) -ge $STALL_AFTER ] && reason=stall
+  else
+    stall_since=0
+  fi
+  # radio on but the modem never registers
+  if [ -z "$reason" ] && [ -z "${GW[wwan0]}" ] && radio_on && [[ "$(modem_state)" =~ ^(searching|enabled)$ ]]; then
+    [ $noreg_since = 0 ] && noreg_since=$now
+    [ $((now - noreg_since)) -ge $NOREG_AFTER ] && reason=noreg
+  else
+    noreg_since=0
+  fi
+  # connected per NetworkManager, yet no IPv4 default route
+  if [ -z "$reason" ] && nmcli -g GENERAL.STATE device show $lte_dev 2>/dev/null | grep -q '^100' && [ -z "${GW[wwan0]}" ]; then
+    [ $nov4_since = 0 ] && nov4_since=$now
+    [ $((now - nov4_since)) -ge $NOV4_AFTER ] && reason=nov4
+  else
+    nov4_since=0
+  fi
+  [ -n "$reason" ] && [ $((now - rec_last)) -ge $rec_cooldown ] || return 0
+  [ $rec_last -gt 0 ] && rec_cooldown=$(( rec_cooldown*2 > REC_MAX ? REC_MAX : rec_cooldown*2 ))
+  rec_last=$now; err_seen=0; nov4_since=0; stall_since=0; noreg_since=0
+  local hm; printf -v hm '%(%H:%M)T' -1
+  rec_note="$reason at $hm, next attempt allowed after ${rec_cooldown}s"
+  case $reason in
+    bam)   recover_bam "bam-dmux runtime PM is 'error'" & ;;
+    stall) recover_bam "data stall: IPv4 gateway up but no probe answered for ${STALL_AFTER}s+" & ;;
+    noreg) recover_bam "modem not registering for ${NOREG_AFTER}s+ (state $(modem_state))" & ;;
+    nov4)  recover_nov4 & ;;
+  esac
+  rec_pid=$!
+}
+
+current=""
+cleanup() { ip route flush table $TABLE 2>/dev/null; ip rule del priority 1001 2>/dev/null; ip rule del priority 1000 2>/dev/null; rm -f $STATE; exit 0; }
+trap cleanup TERM INT
+
+exec {SLEEP}<> <(:)   # an fd nobody writes to: "read -t" on it waits without starting a sleep process
+table_gw=unset   # what table 100 holds, so an unchanged route is not rewritten every round
+while :; do
+  read_gws
+  for w in $WANS; do
+    if [ -n "${GW[$w]}" ] && check $w; then fails[$w]=0; up[$w]=1
+    else fails[$w]=$(( ${fails[$w]} + 1 )); [ ${fails[$w]} -ge $FAIL_AFTER ] && up[$w]=0
+         [ -z "${GW[$w]}" ] && up[$w]=0
+    fi
+  done
+  chosen=""
+  for w in $WANS; do [ "${up[$w]}" = 1 ] && [ -n "${GW[$w]}" ] && { chosen=$w; break; }; done
+
+  if [ -n "$chosen" ]; then
+    want="${GW[$chosen]} $chosen"
+    # rewrite when it changed, and once a minute anyway in case something else flushed the table
+    if [ "$table_gw" != "$want" ] || [ $((++same_rounds % 4)) = 0 ]; then
+      ip route replace default via "${GW[$chosen]}" dev "$chosen" table $TABLE && table_gw=$want
+    fi
+  elif [ "$table_gw" != "" ] || [ $((++same_rounds % 4)) = 0 ]; then
+    ip route flush table $TABLE && table_gw=""
+  fi
+  lte_watch
+  if [ "$chosen" != "$current" ]; then
+    logger -t wan-failover "active uplink: ${current:-none} -> ${chosen:-none (NM default)}"
+    current=$chosen
+  fi
+  printf -v ts '%(%Y-%m-%dT%H:%M:%S%z)T' -1; ts=${ts:0:22}:${ts:22}   # date -Is format (+05:30)
+  { echo "active=${chosen:-none}"; echo "updated=$ts"
+    for w in $WANS; do
+      st=down; [ "${up[$w]}" = 1 ] && st=up
+      echo "$w=$st gw=${GW[$w]} fails=${fails[$w]} check=${how[$w]:-none}"
+    done
+    if [ -n "$rec_note" ]; then echo "lte_recovery=$rec_note"; fi
+  } > $STATE.tmp && mv $STATE.tmp $STATE
+  read -r -t $INTERVAL -u $SLEEP _ || :
+done

@@ -1,0 +1,613 @@
+#!/bin/bash
+# kstick-setup: install, back up, restore or reset the KStick router on an OpenStick stick
+# (MSM8916 4G dongle running OpenStick Debian). Runs ON the stick, as root.
+#
+#   kstick-setup install [options]     install or update the router (run from the unpacked bundle)
+#   kstick-setup backup  [file]        full settings backup (tar.gz, contains secrets)
+#   kstick-setup restore <file>        restore a backup made by this script
+#   kstick-setup reset   [--all] [-y]  clear VPN, firewall, API and other router settings
+#   kstick-setup wired-lan on|off      USB Ethernet adapters as LAN ports (bridge br-lan with the hotspot)
+#
+# Normally driven from the PC by ./kstick.sh, which builds the bundle and copies it over.
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8
+
+SELF=$(readlink -f "$0")
+BUNDLE=${BUNDLE:-$(dirname "$SELF")}
+BACKUP_DIR=/var/backups/kstick
+ADMIN_USER=${ADMIN_USER:-${SUDO_USER:-user}}
+[ "$ADMIN_USER" = root ] && ADMIN_USER=user
+DEFAULT_LAN=192.168.4.1/24 # must match defaultConfig() in config.go
+NMDIR=/etc/NetworkManager/system-connections
+FORMAT=1 # backup format version
+
+say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+[ "$(id -u)" = 0 ] || die "run as root (sudo $0 $*)"
+
+# ---------------------------------------------------------------- helpers
+SWAP_TMP=/swap-kstick-tmp
+swap_on() { # apt needs more than the ~100 MB free RAM; without swap it can hang the stick (zram alone is too small)
+	[ -e $SWAP_TMP ] || { fallocate -l 512M $SWAP_TMP && chmod 600 $SWAP_TMP && mkswap -q $SWAP_TMP; }
+	swapon -p -2 $SWAP_TMP 2>/dev/null || true
+	trap swap_off EXIT
+}
+swap_off() { swapoff $SWAP_TMP 2>/dev/null || true; rm -f $SWAP_TMP; }
+
+con_exists() { nmcli -t -f NAME connection show | grep -qxF "$1"; }
+wlan_suffix() { tr -d ':' </sys/class/net/wlan0/address 2>/dev/null | tail -c 5 | tr a-f A-F; }
+random_psk() { tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 12; }
+
+svc() { systemctl "$@" 2>/dev/null || true; }
+ROUTER_SVCS="router-webui kstick-smsgw wan-failover router-dnsmasq"
+
+# Apply router.json: render firewall/dnsmasq/WAN files and restart what uses them.
+apply_router() {
+	router-webui -render
+	svc reload router-firewall
+	svc restart router-dnsmasq wan-failover router-webui kstick-smsgw
+}
+
+# Point the hotspot at the LAN address in router.json (router-dnsmasq serves DHCP; NM must not).
+# The profile holding the LAN address: the wired-LAN bridge when there is one, else the hotspot.
+lan_con() { if con_exists lan-bridge; then echo lan-bridge; else echo hotspot; fi; }
+lan_cfg_address() {
+	local lan
+	lan=$(sed -n 's/.*"address": *"\([0-9./]*\)".*/\1/p' /etc/router/router.json 2>/dev/null | head -1)
+	echo "${lan:-$DEFAULT_LAN}"
+}
+
+hotspot_address() {
+	local lan con
+	lan=$(lan_cfg_address)
+	con=$(lan_con)
+	if [ "$(nmcli -g ipv4.method,ipv4.addresses connection show "$con" | tr '\n' ' ')" != "manual $lan " ]; then
+		nmcli connection modify "$con" ipv4.method manual ipv4.addresses "$lan" ipv4.gateway "" ipv6.method ignore
+		nmcli -w 30 connection up "$con" >/dev/null || warn "$con did not come up; check Wi-Fi & LAN in the web UI"
+	fi
+}
+
+# ---------------------------------------------------------------- install
+cmd_install() {
+	local whatsapp="" blackbox="" ssid="" psk="" apn="" warp_deb="" warp_token="" cf_token="" cpu_mhz="" harden_ssh=1 slim=1
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--whatsapp) whatsapp=on ;;
+			--no-whatsapp) whatsapp=off ;;
+			--blackbox) blackbox=on ;;
+			--no-blackbox) blackbox=off ;;
+			--wifi-ssid) ssid=$2; shift ;;
+			--wifi-pass) psk=$2; shift ;;
+			--apn) apn=$2; shift ;;
+			--warp-deb) warp_deb=$2; shift ;;
+			--warp-token-file) warp_token=$2; shift ;;
+			--cloudflared-token-file) cf_token=$2; shift ;;
+			--cpu-max-mhz) cpu_mhz=$2; shift ;;
+			--no-ssh-hardening) harden_ssh=0 ;;
+			--no-slim) slim=0 ;;
+			-h | --help) usage ;;
+			*) die "install: unknown option $1" ;;
+		esac
+		shift
+	done
+	[ -n "$psk" ] && { [ ${#psk} -ge 8 ] && [ ${#psk} -le 63 ] || die "--wifi-pass must be 8-63 characters"; }
+	[ -n "$ssid" ] && { [ ${#ssid} -le 32 ] || die "--wifi-ssid must be at most 32 characters"; }
+	case $cpu_mhz in "" | 200 | 400 | 800 | 998 | 0) ;; *) die "--cpu-max-mhz must be 200, 400, 800, 998 (or 0 = no cap)" ;; esac
+	for f in router-webui kstick-smsgw router-firewall wan-failover kstick-blackbox router-webui.service kstick-blackbox.service; do
+		[ -e "$BUNDLE/$f" ] || die "bundle incomplete: $BUNDLE/$f missing (build it with ./kstick.sh)"
+	done
+
+	say "Checking the stick"
+	[ "$(uname -m)" = aarch64 ] || die "this is not an arm64 system"
+	grep -q msm8916 /proc/device-tree/compatible 2>/dev/null || warn "not an MSM8916 board; continuing anyway"
+	for t in nmcli mmcli systemctl apt-get; do command -v $t >/dev/null || die "$t not found: is this an OpenStick Debian image?"; done
+	id "$ADMIN_USER" >/dev/null 2>&1 || die "admin account '$ADMIN_USER' does not exist (set ADMIN_USER=...)"
+	[ -e /sys/class/net/wlan0 ] || warn "wlan0 not present yet: the Wi-Fi hotspot will need setting up later"
+
+	if [ $slim = 1 ]; then
+		say "Low-storage settings: no docs/man pages/translations, journal capped at 32 MB"
+		install -m 644 "$BUNDLE/01-router-slim" /etc/dpkg/dpkg.cfg.d/01-router-slim
+		install -D -m 644 "$BUNDLE/journald-router-size.conf" /etc/systemd/journald.conf.d/10-router-size.conf
+		svc restart systemd-journald
+	fi
+
+	say "Installing packages (with temporary swap)"
+	swap_on
+	apt-get update -q
+	DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+		dnsmasq-base nftables iptables wireguard-tools conntrack iw traceroute curl ca-certificates iputils-ping xz-utils
+	# The full "dnsmasq" package's own service would fight router-dnsmasq for port 53.
+	if [ -e /lib/systemd/system/dnsmasq.service ] || [ -e /usr/lib/systemd/system/dnsmasq.service ]; then svc disable --now dnsmasq; fi
+
+	# Wi-Fi regulatory database: the kernel only accepts one signed with its built-in (sforshee) key; see deploy/regdb/README.md.
+	# Takes effect at the next boot (reloading now could interrupt the hotspot this install may be running over).
+	if [ -f "$BUNDLE/regulatory.db-sforshee" ]; then
+		install -m 644 "$BUNDLE/regulatory.db-sforshee" "$BUNDLE/regulatory.db.p7s-sforshee" /lib/firmware/
+		update-alternatives --quiet --install /lib/firmware/regulatory.db regulatory.db /lib/firmware/regulatory.db-sforshee 10 \
+			--slave /lib/firmware/regulatory.db.p7s regulatory.db.p7s /lib/firmware/regulatory.db.p7s-sforshee
+		update-alternatives --quiet --set regulatory.db /lib/firmware/regulatory.db-sforshee
+	fi
+	# OpenStick images run resize.f2fs on the root partition at every boot; it fails on an ext4 root (and has no business
+	# touching a mounted one anyway).
+	if [ -e /etc/systemd/system/resize-f2fs.service ] && [ "$(findmnt -no FSTYPE /)" != f2fs ]; then svc disable resize-f2fs; fi
+
+	say "Kernel and system tuning (sysctl, zram swap, CPU cap ${cpu_mhz:-unchanged (400 MHz on a new stick)}, no video/Bluetooth drivers)"
+	install -m 644 "$BUNDLE/90-router.conf" /etc/sysctl.d/90-router.conf
+	install -m 644 "$BUNDLE/modules-router.conf" /etc/modules-load.d/router.conf
+	install -m 644 "$BUNDLE/modprobe-router-no-video-bt.conf" /etc/modprobe.d/router-no-video-bt.conf
+	modprobe nf_conntrack 2>/dev/null || true
+	modprobe tun 2>/dev/null || true
+	sysctl -q -p /etc/sysctl.d/90-router.conf || warn "some sysctl settings did not apply"
+	if [ -e /dev/watchdog0 ]; then # hardware watchdog: a hung kernel resets the stick (systemd pets it)
+		install -D -m 644 "$BUNDLE/watchdog-router.conf" /etc/systemd/system.conf.d/90-router-watchdog.conf
+		systemctl daemon-reexec
+	fi
+
+	say "Router programs and services"
+	id smsgw >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin smsgw
+	install -m 755 "$BUNDLE/router-webui" "$BUNDLE/kstick-smsgw" "$BUNDLE/router-firewall" "$BUNDLE/wan-failover" "$BUNDLE/kstick-blackbox" /usr/local/sbin/
+	[ "$SELF" = /usr/local/sbin/kstick-setup ] || install -m 755 "$SELF" /usr/local/sbin/kstick-setup
+	# UI files (router-webui serves them from disk; the binary only has a "UI files missing" page)
+	if [ -f "$BUNDLE/web/index.html" ]; then
+		install -d -m 755 /usr/local/share/router-webui/web
+		install -m 644 "$BUNDLE"/web/* /usr/local/share/router-webui/web/
+		if [ -f "$BUNDLE/web-xp/index.html" ]; then # the optional XP-style UI (System → Web interface)
+			install -d -m 755 /usr/local/share/router-webui/web-xp
+			install -m 644 "$BUNDLE"/web-xp/* /usr/local/share/router-webui/web-xp/
+		fi
+	else
+		echo "warning: the bundle has no web/ folder; keeping the UI files already installed" >&2
+	fi
+	install -m 644 "$BUNDLE/50-kstick-smsgw.rules" /etc/polkit-1/rules.d/50-kstick-smsgw.rules
+	install -d -m 755 /etc/router
+	install -d -m 750 -o root -g smsgw /etc/smsgw
+	install -d -m 750 -o smsgw -g smsgw /var/lib/smsgw
+	install -d -m 700 /var/lib/router
+	# black box: an explicit flag wins; otherwise keep the current choice; a new install turns it on
+	if [ -z "$blackbox" ]; then
+		if [ -e /etc/systemd/system/kstick-blackbox.service ]; then
+			systemctl -q is-enabled kstick-blackbox 2>/dev/null && blackbox=on || blackbox=off
+		else
+			blackbox=on
+		fi
+	fi
+	for u in router-webui kstick-smsgw router-dnsmasq router-firewall wan-failover router-zram router-cpufreq kstick-blackbox; do
+		install -m 644 "$BUNDLE/$u.service" /etc/systemd/system/
+	done
+	# The per-stick cap lives in a drop-in, so reinstalling or deploy.sh (which copy the unit, default 400 MHz)
+	# keep it. No --cpu-max-mhz: keep whatever the stick has.
+	if [ -n "$cpu_mhz" ]; then
+		local khz=$((cpu_mhz * 1000))
+		case $cpu_mhz in 0 | 998) khz=998400 ;; esac
+		install -d -m 755 /etc/systemd/system/router-cpufreq.service.d
+		printf '[Service]\n# set by kstick-setup --cpu-max-mhz %s (998400 = hardware maximum, no cap)\nEnvironment=GOV=schedutil MAX=%s\n' \
+			"$cpu_mhz" "$khz" >/etc/systemd/system/router-cpufreq.service.d/10-cap.conf
+	fi
+	systemctl daemon-reload
+	# USB keyboards (docks, wireless receivers) must not suspend or reboot the router
+	install -D -m 644 "$BUNDLE/logind-router-keys.conf" /etc/systemd/logind.conf.d/20-router-keys.conf
+	systemctl kill -s HUP systemd-logind 2>/dev/null || true # logind re-reads its config on SIGHUP
+
+	# Optional modules: an explicit flag wins; otherwise keep the current choice; a new install excludes WhatsApp.
+	if [ -n "$whatsapp" ] || [ ! -e /etc/router/modules.conf ]; then
+		printf '# KStick optional modules (on|off). Restart router-webui after changing.\n# whatsapp: forward received SMS to WhatsApp via an external WAWAT server\nwhatsapp=%s\n' "${whatsapp:-off}" >/etc/router/modules.conf
+	fi
+	say "Modules: $(grep -v '^#' /etc/router/modules.conf | tr '\n' ' ')"
+
+	say "Network profiles"
+	setup_hotspot "$ssid" "$psk"
+	setup_lte "$apn"
+
+	say "Starting the router"
+	[ -f /var/lib/misc/router-dnsmasq.leases ] || cp /var/lib/NetworkManager/dnsmasq-wlan0.leases /var/lib/misc/router-dnsmasq.leases 2>/dev/null || true
+	router-webui -render # creates /etc/router/router.json with defaults on a new stick
+	systemctl enable router-firewall >/dev/null 2>&1
+	systemctl restart router-firewall
+	con_exists hotspot && hotspot_address
+	systemctl enable router-zram router-cpufreq router-dnsmasq wan-failover router-webui kstick-smsgw >/dev/null 2>&1
+	systemctl start router-zram 2>/dev/null || warn "zram swap did not start (kernel module missing?)"
+	systemctl restart router-cpufreq router-dnsmasq wan-failover router-webui kstick-smsgw
+	if [ "$blackbox" = on ]; then
+		systemctl enable kstick-blackbox >/dev/null 2>&1; systemctl restart kstick-blackbox
+		say "Black box: on (/var/log/kstick-blackbox.log: state every 5 s and reset reasons at each boot)"
+	else
+		svc disable --now kstick-blackbox
+		say "Black box: off"
+	fi
+
+	if [ -n "$warp_deb" ]; then install_warp "$warp_deb" "$warp_token"; fi
+	if [ -n "$cf_token" ]; then install_cloudflared "$cf_token"; fi
+
+	# Key-only SSH, but only when the admin already has a key (or this would lock them out).
+	if [ $harden_ssh = 1 ]; then
+		if [ -s "/home/$ADMIN_USER/.ssh/authorized_keys" ]; then
+			install -m 644 "$BUNDLE/sshd-90-router.conf" /etc/ssh/sshd_config.d/90-router.conf
+			sshd -t && svc reload ssh
+			say "SSH: key login only (password login disabled)"
+		else
+			warn "no SSH key in /home/$ADMIN_USER/.ssh/authorized_keys: leaving password login on (run ssh-copy-id, then install again)"
+		fi
+	fi
+
+	if [ $slim = 1 ]; then # package lists are ~90 MB; apt-get update fetches them again when needed
+		apt-get clean
+		find /var/lib/apt/lists -mindepth 1 -maxdepth 1 ! -name partial ! -name lock -exec rm -rf {} +
+	fi
+	swap_off
+	trap - EXIT
+	say "Done."
+	local failed
+	failed=$(systemctl is-failed router-firewall router-dnsmasq wan-failover router-webui kstick-smsgw 2>/dev/null | grep -c failed || true)
+	[ "$failed" = 0 ] || warn "$failed router service(s) failed: systemctl --failed"
+	echo
+	echo "  Web UI:   https://$(nmcli -g ipv4.addresses connection show "$(lan_con)" 2>/dev/null | cut -d/ -f1 | head -1)  (Wi-Fi)  or https://<USB address>"
+	echo "  Login:    the '$ADMIN_USER' account password (change it on the System page)"
+	if [ -n "${NEW_WIFI:-}" ]; then echo "  Wi-Fi:    $NEW_WIFI"; fi
+	echo "  Backup:   sudo kstick-setup backup      Reset: sudo kstick-setup reset"
+}
+
+# The router code expects NetworkManager profiles named "hotspot" (AP on wlan0) and "lte" (gsm).
+setup_hotspot() {
+	local ssid=$1 psk=$2 other
+	if ! con_exists hotspot; then
+		# An access-point profile under another name (e.g. from the firmware image) is adopted and renamed.
+		other=$(nmcli -t -f NAME,TYPE connection show | awk -F: '$2=="802-11-wireless"{print $1}' | while read -r n; do
+			[ "$(nmcli -g 802-11-wireless.mode connection show "$n")" = ap ] && echo "$n" && break; done || true)
+		if [ -n "$other" ]; then
+			say "Using existing access point profile '$other' as 'hotspot'"
+			nmcli connection modify "$other" connection.id hotspot
+		fi
+	fi
+	if ! con_exists hotspot; then
+		ssid=${ssid:-KStick-$(wlan_suffix)}
+		psk=${psk:-$(random_psk)}
+		nmcli connection add type wifi ifname wlan0 con-name hotspot autoconnect yes ssid "$ssid" \
+			802-11-wireless.mode ap 802-11-wireless.band bg 802-11-wireless.channel 6 \
+			wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn wifi-sec.pairwise ccmp wifi-sec.group ccmp wifi-sec.psk "$psk" \
+			ipv4.method manual ipv4.addresses "$DEFAULT_LAN" ipv6.method ignore connection.autoconnect-priority 100 >/dev/null
+		NEW_WIFI="$ssid / password $psk"
+		say "Created Wi-Fi hotspot: $NEW_WIFI"
+	else
+		[ -n "$ssid" ] && nmcli connection modify hotspot 802-11-wireless.ssid "$ssid"
+		[ -n "$psk" ] && nmcli connection modify hotspot wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk"
+		if [ -n "$ssid$psk" ]; then NEW_WIFI="${ssid:-$(nmcli -g 802-11-wireless.ssid connection show hotspot)} (changed)"; fi
+	fi
+}
+
+setup_lte() {
+	local apn=$1 other
+	if ! con_exists lte; then
+		other=$(nmcli -t -f NAME,TYPE connection show | awk -F: '$2=="gsm"{print $1; exit}')
+		if [ -n "$other" ]; then
+			say "Using existing mobile data profile '$other' as 'lte'"
+			nmcli connection modify "$other" connection.id lte
+		else
+			nmcli connection add type gsm ifname '*' con-name lte autoconnect yes gsm.apn "$apn" \
+				ipv4.method auto ipv6.method auto >/dev/null
+			say "Created mobile data profile 'lte' (APN: ${apn:-automatic})"
+			return
+		fi
+	fi
+	[ -n "$apn" ] && nmcli connection modify lte gsm.apn "$apn"
+	return 0
+}
+
+install_warp() {
+	local deb=$1 token=$2
+	say "Cloudflare WARP (headless package)"
+	dpkg -i "$deb" || DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends -f
+	apt-mark hold cloudflare-warp >/dev/null
+	install -D -m 644 "$BUNDLE/warp-svc-lowmem.conf" /etc/systemd/system/warp-svc.service.d/10-router-lowmem.conf
+	systemctl daemon-reload
+	systemctl enable warp-svc >/dev/null 2>&1
+	systemctl restart warp-svc
+	if [ -n "$token" ]; then
+		local i
+		for i in 1 2 3 4 5 6 7 8 9 10; do warp-cli --accept-tos status >/dev/null 2>&1 && break; sleep 2; done
+		if warp-cli --accept-tos registration show >/dev/null 2>&1; then
+			say "WARP is already registered; keeping the existing registration"
+		else
+			warp-cli --accept-tos connector new "$(cat "$token")" && warp-cli --accept-tos connect ||
+				warn "WARP registration failed: run 'warp-cli connector new <token>' on the stick"
+		fi
+		shred -u "$token" 2>/dev/null || rm -f "$token"
+	fi
+}
+
+install_cloudflared() {
+	local token=$1
+	say "Cloudflare Tunnel (cloudflared) for the public SMS gateway"
+	if ! command -v cloudflared >/dev/null; then
+		curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg -o /usr/share/keyrings/cloudflare-public-v2.gpg
+		echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+			>/etc/apt/sources.list.d/cloudflared.list
+		apt-get update -q
+		DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends cloudflared
+	fi
+	install -d -m 700 /etc/cloudflared
+	install -m 600 "$token" /etc/cloudflared/token
+	shred -u "$token" 2>/dev/null || rm -f "$token"
+	install -m 644 "$BUNDLE/cloudflared.service" /etc/systemd/system/cloudflared.service
+	systemctl daemon-reload
+	systemctl enable cloudflared >/dev/null 2>&1
+	systemctl restart cloudflared
+}
+
+# ---------------------------------------------------------------- backup / restore
+# Everything that makes this stick "yours". Paths are relative to / and the only ones restore accepts.
+backup_paths() {
+	local with_sms=$1 with_cf=$2
+	echo etc/router/router.json etc/router/modules.conf etc/router/wawat.json etc/router/forward.json etc/router/tls etc/router/own-number etc/router/opencellid-key
+	echo etc/smsgw/config.json var/lib/router/wawat-state.json var/lib/router/sms-sim-imported
+	echo "home/$ADMIN_USER/.ssh/authorized_keys"
+	(cd / && ls etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null) || true
+	[ "$with_sms" = 1 ] && echo var/lib/smsgw/sms.db
+	[ "$with_cf" = 1 ] && echo etc/cloudflared/token var/lib/cloudflare-warp
+	return 0
+}
+RESTORE_ALLOW='^(etc/router/(router\.json|modules\.conf|wawat\.json|forward\.json|own-number|opencellid-key|tls(/.*)?)|etc/smsgw/config\.json|var/lib/router/(wawat-state\.json|sms-sim-imported)|home/[a-z_][a-z0-9_-]*/\.ssh/authorized_keys|etc/NetworkManager/system-connections/[^/]+\.nmconnection|var/lib/smsgw/sms\.db|etc/cloudflared/token|var/lib/cloudflare-warp(/.*)?|KSTICK-BACKUP)/?$'
+
+cmd_backup() {
+	local out="" with_sms=1 with_cf=1 quiet=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--no-sms-log) with_sms=0 ;;
+			--no-cloudflare) with_cf=0 ;;
+			--quiet) quiet=1 ;;
+			-h | --help) usage ;;
+			-*) die "backup: unknown option $1" ;;
+			*) out=$1 ;;
+		esac
+		shift
+	done
+	install -d -m 700 $BACKUP_DIR
+	out=${out:-$BACKUP_DIR/kstick-backup-$(hostname)-$(date +%Y%m%d-%H%M%S).tar.gz}
+	local stage list p
+	stage=$(mktemp -d)
+	{
+		echo "format=$FORMAT"
+		echo "created=$(date -Is)"
+		echo "hostname=$(hostname)"
+		echo "model=$(tr -d '\0' </proc/device-tree/model 2>/dev/null)"
+		echo "admin_user=$ADMIN_USER"
+		echo "sms_log=$with_sms cloudflare=$with_cf"
+	} >"$stage/KSTICK-BACKUP"
+	list=()
+	for p in $(backup_paths $with_sms $with_cf); do [ -e "/$p" ] && list+=("$p"); done
+	# A consistent copy of the SQLite SMS log needs its writers stopped for a moment.
+	local stopped=0
+	if [ $with_sms = 1 ] && [ -e /var/lib/smsgw/sms.db ]; then svc stop router-webui kstick-smsgw; stopped=1; fi
+	local rc=0
+	(umask 077 && tar -czf "$out" --numeric-owner -C "$stage" KSTICK-BACKUP -C / "${list[@]}") || rc=$?
+	[ $stopped = 1 ] && svc start router-webui kstick-smsgw
+	rm -rf "$stage"
+	[ $rc = 0 ] || { rm -f "$out"; die "backup failed (tar exit $rc)"; }
+	chmod 600 "$out"
+	if [ $quiet = 1 ]; then echo "$out"; return; fi
+	say "Backup written: $out ($(du -h "$out" | cut -f1), ${#list[@]} items)"
+	warn "it contains Wi-Fi/VPN keys, API key hashes and tokens: keep it private"
+}
+
+cmd_restore() {
+	local in="" yes=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+			-y | --yes) yes=1 ;;
+			-h | --help) usage ;;
+			-*) die "restore: unknown option $1" ;;
+			*) in=$1 ;;
+		esac
+		shift
+	done
+	[ -f "$in" ] || die "restore: backup file '$in' not found"
+	local names bad
+	names=$(tar -tzf "$in") || die "not a readable tar.gz"
+	echo "$names" | grep -qx KSTICK-BACKUP || die "not a kstick-setup backup (no KSTICK-BACKUP manifest)"
+	bad=$(echo "$names" | grep -Ev "$RESTORE_ALLOW" || true)
+	[ -z "$bad" ] || die "backup contains unexpected paths, refusing: $(echo "$bad" | head -3 | tr '\n' ' ')"
+	local manifest
+	manifest=$(tar -xzOf "$in" KSTICK-BACKUP)
+	grep -q "^format=$FORMAT$" <<<"$manifest" || die "unsupported backup format"
+	echo "$manifest" | sed 's/^/  /'
+	if [ $yes = 0 ]; then
+		read -r -p "Replace this stick's settings with this backup? Wi-Fi and VPN reconnect. [y/N] " a
+		[[ $a =~ ^[Yy] ]] || die "cancelled"
+	fi
+
+	say "Saving the current settings first"
+	cmd_backup --quiet "$BACKUP_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz" >/dev/null
+	local has_cf=0
+	echo "$names" | grep -qE '^(etc/cloudflared|var/lib/cloudflare-warp)' && has_cf=1
+
+	say "Restoring"
+	svc stop $ROUTER_SVCS
+	[ $has_cf = 1 ] && svc stop warp-svc cloudflared
+	# The backup's VPN tunnels replace the current ones. Other profiles are overwritten by name;
+	# the USB management link is never deleted, so this session survives.
+	if echo "$names" | grep -q '^etc/NetworkManager/system-connections/.'; then
+		local u
+		for u in $(nmcli -t -f UUID,TYPE connection show | awk -F: '$2=="wireguard"{print $1}'); do
+			nmcli connection delete "$u" >/dev/null || true
+		done
+	fi
+	tar -xzf "$in" --no-same-owner --no-overwrite-dir -C / --exclude KSTICK-BACKUP
+	# Ownership by name (uids differ between installs).
+	chown -R root:root /etc/router $NMDIR 2>/dev/null || true
+	chmod 600 $NMDIR/*.nmconnection 2>/dev/null || true
+	chmod 600 /etc/router/router.json /etc/router/wawat.json /etc/router/forward.json /etc/router/opencellid-key 2>/dev/null || true
+	[ -e /etc/smsgw/config.json ] && chown root:smsgw /etc/smsgw /etc/smsgw/config.json && chmod 640 /etc/smsgw/config.json
+	[ -e /var/lib/smsgw/sms.db ] && chown smsgw:smsgw /var/lib/smsgw /var/lib/smsgw/sms.db && chmod 640 /var/lib/smsgw/sms.db
+	[ -d /var/lib/router ] && chown -R root:root /var/lib/router && chmod 700 /var/lib/router
+	[ -e /etc/cloudflared/token ] && chown -R root:root /etc/cloudflared && chmod 600 /etc/cloudflared/token
+	[ -d /var/lib/cloudflare-warp ] && chown -R root:root /var/lib/cloudflare-warp
+	local ak
+	for ak in /home/*/.ssh/authorized_keys; do
+		[ -e "$ak" ] || continue
+		local u; u=$(basename "$(dirname "$(dirname "$ak")")")
+		id "$u" >/dev/null 2>&1 && chown "$u:$u" "$ak" && chmod 600 "$ak"
+	done
+
+	nmcli connection reload
+	# Reactivate restored profiles so their settings take effect (Wi-Fi clients reconnect once).
+	con_exists hotspot && { hotspot_address; nmcli -w 30 connection up hotspot >/dev/null || warn "hotspot did not come up"; }
+	local w
+	for w in $(nmcli -t -f NAME,TYPE,AUTOCONNECT connection show | awk -F: '$2=="wireguard" && $3=="yes"{print $1}'); do
+		nmcli -w 20 connection up "$w" >/dev/null || warn "VPN tunnel $w did not come up"
+	done
+	apply_router
+	if [ $has_cf = 1 ]; then
+		[ -d /var/lib/cloudflare-warp ] && command -v warp-cli >/dev/null && svc restart warp-svc
+		[ -e /etc/cloudflared/token ] && command -v cloudflared >/dev/null && svc restart cloudflared
+	fi
+	nmcli connection up lte >/dev/null 2>&1 || true
+	say "Restored. The previous settings are in $BACKUP_DIR/pre-restore-*.tar.gz"
+}
+
+# ---------------------------------------------------------------- reset
+cmd_reset() {
+	local all=0 yes=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--all) all=1 ;;
+			-y | --yes) yes=1 ;;
+			-h | --help) usage ;;
+			*) die "reset: unknown option $1" ;;
+		esac
+		shift
+	done
+	cat <<-EOF
+	This clears:
+	  - all router settings (LAN/DHCP, static leases, DNS, firewall rules, port forwards, blocked clients, WAN, IPv6)
+	  - every WireGuard VPN tunnel
+	  - the SMS gateway configuration and all API keys
+	  - the WhatsApp forward configuration
+	  Firewall defaults turn management over Cloudflare Mesh off: keep a USB or Wi-Fi connection.
+	EOF
+	if [ $all = 1 ]; then
+		cat <<-EOF
+		  --all also clears:
+		  - Wi-Fi name and password (a new random password is printed)
+		  - the mobile data APN (back to automatic)
+		  - the SMS log, the TLS certificate, the Cloudflare Mesh registration and Tunnel token
+		EOF
+	else
+		echo "Kept: Wi-Fi name/password, mobile data APN, USB link, SSH keys, admin password, SMS log, Cloudflare Mesh/Tunnel."
+	fi
+	if [ $yes = 0 ]; then
+		read -r -p "Reset now? [y/N] " a
+		[[ $a =~ ^[Yy] ]] || die "cancelled"
+	fi
+
+	say "Saving the current settings first"
+	local saved
+	saved=$(cmd_backup --quiet "$BACKUP_DIR/pre-reset-$(date +%Y%m%d-%H%M%S).tar.gz")
+
+	say "Clearing settings"
+	svc stop $ROUTER_SVCS
+	local uuid
+	for uuid in $(nmcli -t -f UUID,TYPE connection show | awk -F: '$2=="wireguard"{print $1}'); do
+		nmcli connection delete "$uuid" >/dev/null && echo "  removed VPN tunnel $uuid"
+	done
+	rm -f /etc/router/router.json /etc/router/router.json.* /etc/router/wawat.json /etc/router/forward.json /var/lib/router/wawat-state.json /etc/smsgw/config.json
+	if [ $all = 1 ]; then
+		rm -rf /etc/router/tls
+		rm -f /var/lib/smsgw/sms.db /var/lib/smsgw/sms.db-wal /var/lib/smsgw/sms.db-shm /var/lib/smsgw/sent.jsonl*
+		if command -v warp-cli >/dev/null; then warp-cli --accept-tos registration delete >/dev/null 2>&1 || true; fi
+		svc disable --now cloudflared
+		rm -f /etc/cloudflared/token
+		if con_exists hotspot; then
+			local psk; psk=$(random_psk)
+			nmcli connection modify hotspot 802-11-wireless.ssid "KStick-$(wlan_suffix)" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk"
+			NEW_WIFI="KStick-$(wlan_suffix) / password $psk"
+		fi
+		con_exists lte && nmcli connection modify lte gsm.apn "" gsm.username "" gsm.password ""
+	fi
+
+	router-webui -render # writes a default router.json (new IPv6 prefix) and renders it
+	con_exists hotspot && hotspot_address
+	if [ $all = 1 ] && con_exists hotspot; then nmcli -w 30 connection up hotspot >/dev/null || true; fi
+	apply_router
+	say "Reset done. Previous settings saved in $saved"
+	if [ -n "${NEW_WIFI:-}" ]; then echo "  Wi-Fi: $NEW_WIFI"; fi
+}
+
+# ---------------------------------------------------------------- wired LAN
+# USB Ethernet adapters (enx*, eth*: docks, dongles) as LAN ports. Bridge br-lan takes the LAN address; the
+# hotspot and every such adapter become its ports, so wired and Wi-Fi clients share one network and DHCP pool.
+# NetworkManager stops creating "Wired connection N" DHCP profiles. router-webui picks br-lan at its start.
+cmd_wired_lan() {
+	local mode=${1:-status} lan mac psk
+	case $mode in
+		on)
+			con_exists hotspot || die "no hotspot profile"
+			lan=$(lan_cfg_address)
+			mac=$(cat /sys/class/net/wlan0/address)
+			install -d -m 755 /etc/NetworkManager/conf.d
+			printf '[main]\n# kstick-setup wired-lan: no automatic DHCP profiles for new Ethernet devices\nno-auto-default=*\n' \
+				>/etc/NetworkManager/conf.d/20-router-no-auto-default.conf
+			nmcli general reload conf 2>/dev/null || true
+			# drop the automatic in-memory "Wired connection N" profiles of USB adapters
+			nmcli -t -f UUID,TYPE,FILENAME connection show | awk -F: '$2=="802-3-ethernet" && $3 ~ /^\/run\// {print $1}' |
+				while read -r u; do nmcli connection delete "$u" >/dev/null || true; done
+			if ! con_exists lan-bridge; then
+				say "Creating bridge br-lan ($lan) for Wi-Fi + wired LAN"
+				nmcli connection add type bridge con-name lan-bridge ifname br-lan autoconnect yes \
+					bridge.stp no bridge.forward-delay 0 ethernet.cloned-mac-address "$mac" \
+					ipv4.method manual ipv4.addresses "$lan" ipv6.method ignore connection.autoconnect-ports true >/dev/null
+			fi
+			con_exists lan-ethernet || nmcli connection add type ethernet con-name lan-ethernet \
+				match.interface-name "enx* eth*" port-type bridge controller br-lan autoconnect yes >/dev/null
+			say "Moving the hotspot into the bridge (Wi-Fi restarts)"
+			# nmcli drops the stored Wi-Fi password when it turns the profile into a bridge port: carry it over
+			psk=$(nmcli -s -g 802-11-wireless-security.psk connection show hotspot)
+			[ -n "$psk" ] || die "the hotspot has no stored Wi-Fi password; set it in the web UI first"
+			nmcli connection modify hotspot ipv4.method disabled ipv6.method disabled port-type bridge controller br-lan \
+				802-11-wireless-security.psk "$psk"
+			[ "$(nmcli -s -g 802-11-wireless-security.psk connection show hotspot)" = "$psk" ] || die "Wi-Fi password was lost; set it again in the web UI"
+			nmcli -w 30 connection up lan-bridge >/dev/null || warn "br-lan did not come up"
+			nmcli -w 30 connection up hotspot >/dev/null || warn "hotspot did not come up"
+			for d in $(ls /sys/class/net | grep -E '^(enx|eth)'); do nmcli -w 15 connection up lan-ethernet ifname "$d" >/dev/null || true; done
+			systemctl restart router-webui
+			;;
+		off)
+			con_exists lan-bridge || { say "wired LAN is not on"; return 0; }
+			lan=$(nmcli -g ipv4.addresses connection show lan-bridge | head -1)
+			lan=${lan:-$(lan_cfg_address)}
+			say "Moving the LAN address back to the hotspot (Wi-Fi restarts)"
+			psk=$(nmcli -s -g 802-11-wireless-security.psk connection show hotspot)
+			nmcli connection modify hotspot port-type "" controller "" ipv4.method manual ipv4.addresses "$lan" ipv4.gateway "" ipv6.method ignore \
+				${psk:+802-11-wireless-security.psk "$psk"}
+			nmcli connection delete lan-ethernet >/dev/null 2>&1 || true
+			nmcli connection delete lan-bridge >/dev/null 2>&1 || true
+			rm -f /etc/NetworkManager/conf.d/20-router-no-auto-default.conf
+			nmcli general reload conf 2>/dev/null || true
+			nmcli -w 30 connection up hotspot >/dev/null || warn "hotspot did not come up"
+			systemctl restart router-webui
+			;;
+		status) ;;
+		*) die "usage: kstick-setup wired-lan on|off|status" ;;
+	esac
+	if con_exists lan-bridge; then
+		echo "wired LAN: on ($(nmcli -g ipv4.addresses connection show lan-bridge | head -1) on br-lan)"
+		bridge link 2>/dev/null | sed 's/^[0-9]*: /  port /' || true
+	else
+		echo "wired LAN: off (LAN on wlan0 only)"
+	fi
+}
+
+# ---------------------------------------------------------------- main
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+# Keep going if the SSH session drops (restore/reset restart networking): a half-applied change is worse.
+case $cmd in install | restore | reset | wired-lan) trap '' HUP ;; esac
+case $cmd in
+	install) cmd_install "$@" ;;
+	backup) cmd_backup "$@" ;;
+	restore) cmd_restore "$@" ;;
+	reset) cmd_reset "$@" ;;
+	wired-lan) cmd_wired_lan "$@" ;;
+	-h | --help | help | "") usage ;;
+	*) die "unknown command '$cmd' (install, backup, restore, reset, wired-lan)" ;;
+esac

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Detach the kernel text console (fbcon) from the MF800 SPI LCD. fbcon keeps flushing to the panel through
+# panel-mipi-dbi-spi, which collided with router-webui's drawing and the stock lcd_ctl tool
+# ("SPI transfer failed: -110"). The panel driver stays bound, so its L6/L17 supplies keep the LCD powered.
+for i in $(seq 1 60); do
+  for v in /sys/class/vtconsole/vtcon*; do
+    if grep -q "frame buffer" "$v/name" 2>/dev/null; then
+      [ "$(cat "$v/bind")" = 1 ] && echo 0 > "$v/bind"
+      echo "detached fbcon ($v)"; exit 0
+    fi
+  done
+  sleep 0.5
+done
+echo "no framebuffer vtconsole found"; exit 0

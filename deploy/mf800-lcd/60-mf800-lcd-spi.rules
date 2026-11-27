@@ -1,0 +1,3 @@
+# MF800 LCD: spi_qup on 6.6.0-msm8916 times out every transfer (-110) after a runtime suspend/resume
+# of the SPI5 controller. Keep it powered (it only idles at the QUP clock; the panel has its own sleep).
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="78b9000.spi", ATTR{power/control}="on"

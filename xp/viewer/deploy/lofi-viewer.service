@@ -1,0 +1,40 @@
+[Unit]
+Description=lofi-viewer: read-only KStick XP dashboard (published by a local Cloudflare Tunnel)
+After=network-online.target NetworkManager.service ModemManager.service
+Wants=network-online.target
+
+[Service]
+User=lofiview
+Group=lofiview
+ExecStart=/usr/local/sbin/lofi-viewer serve -listen 127.0.0.1:8090 -web /usr/local/share/router-webui/web-xp -allow 127.0.0.1,::1 -trust 127.0.0.1,::1
+Restart=always
+RestartSec=3
+Environment=GOMEMLIMIT=12MiB GOGC=50
+MemoryMax=40M
+CPUWeight=50
+Nice=5
+# sandbox: no privileges, read-only system, only loopback (the local cloudflared) may talk to it
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

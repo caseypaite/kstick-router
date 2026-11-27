@@ -1,0 +1,40 @@
+#!/bin/sh
+# mesh-lan-gw: let LAN clients of this router reach Cloudflare Mesh peers (100.96.0.0/12).
+#  1. forward rule inside router-webui's own table (its forward chain drops by default, so the
+#     accept must live there); re-added whenever router-webui regenerates the firewall.
+#  2. masquerade in a separate table (router-webui never touches other tables), so LAN clients
+#     appear on the mesh as this node's mesh address.
+# Only matches br-lan -> CloudflareWARP; the router's own mesh traffic is untouched.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LAN_IF=br-lan LAN_NET=192.168.4.0/24 MESH_IF=CloudflareWARP MESH_NET=100.96.0.0/12
+TAG="mesh-lan-gw: LAN to Cloudflare Mesh"
+
+ensure_nat() {
+  nft list table ip mesh-lan >/dev/null 2>&1 && nft list chain ip mesh-lan post 2>/dev/null | grep -q masquerade && return 0
+  nft -f - <<NFT
+table ip mesh-lan
+delete table ip mesh-lan
+table ip mesh-lan {
+  chain post {
+    type nat hook postrouting priority srcnat + 10; policy accept;
+    oifname "$MESH_IF" ip saddr $LAN_NET masquerade comment "mesh-lan-gw"
+  }
+}
+NFT
+  echo "nat table installed"
+}
+ensure_fwd() {
+  nft list chain inet router forward >/dev/null 2>&1 || { echo "router table not loaded yet"; return 1; }
+  nft list chain inet router forward | grep -q "$TAG" && return 0
+  h=$(nft -a list chain inet router forward | grep 'comment "dropped forward"' | grep -o 'handle [0-9]*' | cut -d' ' -f2)
+  if [ -n "$h" ]; then pos="handle $h"; verb=insert; else pos=""; verb=add; fi
+  nft $verb rule inet router forward $pos iifname "$LAN_IF" oifname "$MESH_IF" ip daddr $MESH_NET accept comment "\"$TAG\""
+  echo "forward rule installed"
+}
+case "${1:-apply}" in
+  apply)  ensure_nat; ensure_fwd ;;
+  remove) nft delete table ip mesh-lan 2>/dev/null
+          for h in $(nft -a list chain inet router forward 2>/dev/null | grep -e "$TAG" | grep -o 'handle [0-9]*' | cut -d' ' -f2); do nft delete rule inet router forward handle $h; done
+          echo removed ;;
+  status) nft list chain inet router forward | grep -e "$TAG"; nft list table ip mesh-lan ;;
+esac

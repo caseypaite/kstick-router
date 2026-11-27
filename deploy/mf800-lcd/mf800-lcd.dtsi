@@ -1,0 +1,79 @@
+/* MF800 1.44" 128x128 GC9107 TFT on top of the stock OpenStick DTB (msm8916-fy-mf800-fixed.dtb).
+ * Appended to the decompiled base DTB by build.sh; it only adds nodes and enables spi@78b9000.
+ *
+ * Wiring (same board family as the MF800H). The modem firmware re-muxes the SPI pins as GPIOs at boot
+ *   and now and then later; router-webui (lcd.go) puts them back via pinctrl debugfs pinmux-select.
+ *   SPI5 (BLSP1 QUP5, spi@78b9000): GPIO16 MOSI, GPIO19 CLK, GPIO18 CS (active low, GPIO chip-select)
+ *   GPIO11 reset, GPIO30 D/C, panel 2.85 V = L17, logic 1.8 V = L6
+ *   backlight: PM8916 MPP4 as a 10 mA current sink, exposed as LED "mf800:lcd"
+ * Panel init sequence: /lib/firmware/fy,mf800-lcd.bin (panel-mipi-dbi, see mkfw.py).
+ */
+/ {
+	lcd-backlight {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd_backlight_state>;
+
+		backlight {
+			label = "mf800:lcd";
+			gpios = <&{/soc@0/spmi@200f000/pmic@0/mpps@a000} 4 0>;
+			default-state = "on";
+		};
+	};
+};
+
+&{/soc@0/pinctrl@1000000} {
+	lcd_ctrl_state: lcd-control-state {
+		pins = "gpio11", "gpio30";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+};
+
+&{/soc@0/spmi@200f000/pmic@0/mpps@a000} {
+	lcd_backlight_state: lcd-backlight-state {
+		pins = "mpp4";
+		function = "sink";
+		drive-strength = <10>;
+		qcom,dtest = <0>;
+		output-low;
+	};
+};
+
+&{/soc@0/spi@78b9000} {
+	status = "okay";
+	/* 6.6.0-msm8916: with BAM DMA every transfer timed out (-110, QUP irq never fired); FIFO/PIO works. */
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+	cs-gpios = <&{/soc@0/pinctrl@1000000} 18 1>;
+	num-cs = <1>;
+
+	display@0 {
+		compatible = "fy,mf800-lcd", "panel-mipi-dbi-spi";
+		reg = <0>;
+		spi-max-frequency = <16000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd_ctrl_state>;
+		reset-gpios = <&{/soc@0/pinctrl@1000000} 11 0>;
+		dc-gpios = <&{/soc@0/pinctrl@1000000} 30 0>;
+		power-supply = <&{/remoteproc/smd-edge/rpm-requests/regulators/l17}>;
+		io-supply = <&{/remoteproc/smd-edge/rpm-requests/regulators/l6}>;
+		write-only;
+		format = "r5g6b5";
+		width-mm = <26>;
+		height-mm = <26>;
+
+		panel-timing {
+			clock-frequency = <0>;
+			hactive = <128>;
+			vactive = <128>;
+			hfront-porch = <0>;
+			hback-porch = <0>;
+			hsync-len = <0>;
+			vfront-porch = <0>;
+			vback-porch = <0>;
+			vsync-len = <0>;
+		};
+	};
+};

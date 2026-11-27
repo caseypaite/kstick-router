@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>KStick XP</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- shared SVG gradients for the icon set (inline SVG may reference them from anywhere in the document) -->
+<svg class="defs" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <linearGradient id="g-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9fd3ff"/><stop offset="1" stop-color="#1c5fd1"/></linearGradient>
+    <linearGradient id="g-screen" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7cc3ff"/><stop offset="1" stop-color="#0a3fb0"/></linearGradient>
+    <linearGradient id="g-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b6ef7a"/><stop offset="1" stop-color="#2a8a1c"/></linearGradient>
+    <linearGradient id="g-yellow" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff6b0"/><stop offset="1" stop-color="#e2a414"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd08a"/><stop offset="1" stop-color="#ef7d14"/></linearGradient>
+    <linearGradient id="g-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffa28a"/><stop offset="1" stop-color="#c62a18"/></linearGradient>
+    <linearGradient id="g-grey" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#a3abb5"/></linearGradient>
+    <linearGradient id="g-paper" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dfe6ee"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#d9b8ff"/><stop offset="1" stop-color="#6a2fc2"/></linearGradient>
+  </defs>
+</svg>
+
+<!-- boot splash (first load of a browser session only) -->
+<div id="boot" class="boot hidden">
+  <div class="boot-logo"><span id="boot-mark"></span><span class="boot-name">KStick<sup>xp</sup></span></div>
+  <div class="boot-bar"><i></i><i></i><i></i></div>
+  <div class="boot-foot">4G LTE gateway</div>
+</div>
+
+<!-- welcome / sign-in screen -->
+<div id="login" class="welcome hidden">
+  <div class="wl-top"></div>
+  <div class="wl-mid">
+    <div class="wl-left">
+      <div class="wl-logo"><span id="wl-mark"></span><span>KStick<sup>xp</sup></span></div>
+      <p>To begin, sign in with the device account</p>
+    </div>
+    <div class="wl-sep"></div>
+    <div class="wl-right">
+      <form id="login-form" class="wl-user" autocomplete="on">
+        <div class="wl-pic" id="wl-pic"></div>
+        <div class="wl-fields">
+          <input name="username" class="wl-name" autocomplete="username" placeholder="User name" required aria-label="User name">
+          <div class="wl-hint">Type your password</div>
+          <div class="wl-pass">
+            <input name="password" type="password" autocomplete="current-password" required aria-label="Password">
+            <button class="wl-go" type="submit" title="Sign in" aria-label="Sign in"></button>
+          </div>
+          <div id="login-error" class="wl-err"></div>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="wl-bot">
+    <span id="wl-host" class="wl-host"></span>
+    <span class="wl-note">Use the device's system account and its password.<br>Settings that could cut off your connection are undone unless you confirm them.</span>
+  </div>
+</div>
+
+<!-- the desktop -->
+<div id="desktop" class="desktop hidden">
+  <div id="icons" class="icons"></div>
+  <div id="windows"></div>
+  <div id="toasts"></div>
+  <div id="pending" class="balloon pending hidden"></div>
+
+  <div id="startmenu" class="startmenu hidden">
+    <div class="sm-head"><span class="sm-pic" id="sm-pic"></span><span id="sm-user">user</span></div>
+    <div class="sm-body">
+      <div class="sm-left" id="sm-left"></div>
+      <div class="sm-right" id="sm-right"></div>
+    </div>
+    <div class="sm-foot">
+      <button class="sm-fbtn" id="sm-logoff" type="button"><span id="ic-logoff"></span>Log Off</button>
+      <button class="sm-fbtn" id="sm-turnoff" type="button"><span id="ic-turnoff"></span>Turn Off Router</button>
+    </div>
+  </div>
+  <div id="allprogs" class="flyout hidden"></div>
+
+  <div id="taskbar" class="taskbar">
+    <button id="start" class="start" type="button"><span id="start-mark"></span><span>start</span></button>
+    <div id="quick" class="quick"></div>
+    <div id="tasks" class="tasks"></div>
+    <div id="tray" class="tray"><span id="tray-icons" class="tray-icons"></span><span id="clock" class="clock"></span></div>
+  </div>
+</div>
+
+<div id="menu" class="ctxmenu hidden"></div>
+<div id="overlay" class="overlay hidden"></div>
+
+<!-- generic dialog used by the pages (modal(), confirmBox()) -->
+<dialog id="modal" class="xpdlg">
+  <form method="dialog" id="modal-form">
+    <div class="tb"><span class="tb-t" id="modal-title"></span><span class="tb-b"><button value="cancel" class="tbb close" formnovalidate title="Close" aria-label="Close"></button></span></div>
+    <div class="dlg-body">
+      <div id="modal-body"></div>
+      <div class="actions">
+        <button value="ok" id="modal-ok" class="btn primary">Save</button>
+        <button value="cancel" class="btn" formnovalidate>Cancel</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

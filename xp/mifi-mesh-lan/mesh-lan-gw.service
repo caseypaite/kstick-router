@@ -1,0 +1,13 @@
+[Unit]
+Description=Route LAN clients into Cloudflare Mesh (forward + masquerade)
+After=router-firewall.service warp-svc.service
+Wants=router-firewall.service
+
+[Service]
+Type=oneshot
+# give router-webui time to finish loading a regenerated firewall before checking
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/sbin/mesh-lan-gw apply
+
+[Install]
+WantedBy=multi-user.target router-firewall.service

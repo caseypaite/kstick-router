@@ -1,0 +1,12 @@
+[Unit]
+Description=KStick WAN health check and failover (LTE / USB)
+After=NetworkManager.service router-firewall.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/wan-failover
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

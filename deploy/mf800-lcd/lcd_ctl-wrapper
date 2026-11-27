@@ -1,0 +1,12 @@
+#!/bin/sh
+# Installed as /usr/local/bin/lcd_ctl by deploy/mf800-lcd/install.sh. The stock lcd_ctl (kept as lcd_ctl.real) drives
+# the panel through /dev/mem and re-muxes the SPI pins that router-webui uses. on/off/bl go through the kernel instead
+# (fb0 blank + the mf800:lcd backlight LED); everything else goes to the original tool.
+FB=/sys/class/graphics/fb0/blank
+BL=/sys/class/leds/mf800:lcd/brightness
+case "$1" in
+  on)  echo 0 > "$FB" && echo 1 > "$BL" ;;
+  off) echo 0 > "$BL" && echo 1 > "$FB" ;;
+  bl)  echo "${2:-1}" > "$BL" ;;
+  *)   exec /usr/local/bin/lcd_ctl.real "$@" ;;
+esac

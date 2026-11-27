@@ -1,0 +1,20 @@
+[Unit]
+Description=Cloudflare Tunnel client
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+TimeoutStartSec=90
+Type=notify
+# The tunnel token lives in /etc/cloudflared/token (root 0600), never on the command line.
+# One HTTP/2 connection instead of the default 4 QUIC ones: QUIC keepalives kept the LTE radio transmitting
+# every second (644 packets/min) even with no users, overheating the modem; this sends ~15 packets/min.
+# At boot the tunnel used to start before the local resolver (WARP's, when installed) answered: the first
+# attempt failed and only the restart 5 s later connected. Wait up to 60 s for a working lookup first.
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do getent ahosts region1.v2.argotunnel.com >/dev/null && exit 0; sleep 1; done; echo "DNS still not answering, starting anyway"'
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --protocol http2 --ha-connections 1 run --token-file /etc/cloudflared/token
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

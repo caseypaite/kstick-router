@@ -1,0 +1,16 @@
+# Put the stick's USB port in host mode at boot (docks, hubs, USB Ethernet/serial; see README "Extra USB drivers").
+# This drops the USB network link to the PC: manage the stick over Wi-Fi or Mesh instead.
+# Undo: systemctl disable --now usb-host-mode && echo device > /sys/class/usb_role/ci_hdrc.0-role-switch/role
+[Unit]
+Description=USB port in host mode
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'R=/sys/class/usb_role/ci_hdrc.0-role-switch/role; for i in $(seq 30); do [ -w $R ] && break; sleep 1; done; echo host > $R'
+ExecStop=/bin/sh -c 'echo device > /sys/class/usb_role/ci_hdrc.0-role-switch/role'
+
+[Install]
+WantedBy=multi-user.target
